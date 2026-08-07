@@ -1,0 +1,34 @@
+name: Scrape Jumia Phones
+
+on:
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm install cheerio
+      - name: Run scraper
+        env:
+          WEBSCRAPING_API_KEY: ${{ secrets.WEBSCRAPING_API_KEY }}
+        run: node scripts/scraper.js
+      - name: Commit and push data
+        run: |
+          git config user.name "jumia-tracker-bot"
+          git config user.email "bot@jumia-tracker.local"
+          git add data/
+          if git diff --cached --quiet; then
+            echo "No changes in data/"
+          else
+            git commit -m "Update phone data [automated]"
+            git push
+          fi
