@@ -1,15 +1,6 @@
 /**
  * Jumia Nigeria Smartphone Price Tracker — Scraper
- *
- * Fetches the Jumia smartphones category (sorted lowest-price first),
- * filters to the ₦120k–250k range, visits each product page for full specs,
- * and writes out:
- *   data/phones.json      — current snapshot
- *   data/history.json     — per-phone price history
- *   data/last-run-log.json — run summary for debugging
- *
- * Uses the WebScraping.AI /html API endpoint (with JS rendering) for
- * listing pages and /ai/question for spec extraction from product pages.
+ * Uses WebScraping.AI API: /text for listings (stealth proxy), /html + cheerio for specs.
  */
 
 const https = require('https');
@@ -17,10 +8,7 @@ const fs = require('fs');
 const path = require('path');
 
 const API_KEY = process.env.WEBSCRAPING_API_KEY;
-if (!API_KEY) {
-  console.error('FATAL: WEBSCRAPING_API_KEY environment variable is not set.');
-  process.exit(1);
-}
+if (!API_KEY) { console.error('FATAL: WEBSCRAPING_API_KEY not set.'); process.exit(1); }
 
 const API_BASE = 'api.webscraping.ai';
 const LISTING_URL = 'https://www.jumia.com.ng/smartphones/';
@@ -32,304 +20,224 @@ const MAX_RETRIES = 3;
 const INITIAL_BACKOFF_MS = 2000;
 const MAX_PAGES = 30;
 
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-function fetchHTML(url, opts = {}) {
-  const params = new URLSearchParams({
-    api_key: API_KEY, url, js: 'true',
-    timeout: opts.timeout || 25000,
-    proxy: opts.proxy || 'datacenter',
-  });
+function callAPI(endpoint, qp = {}) {
+  const qs = new URLSearchParams({ api_key: API_KEY, ...qp }).toString();
   return new Promise((resolve, reject) => {
-    const req = https.get(
-      `https://${API_BASE}/html?${params.toString()}`,
-      { timeout: 30000 },
-      (res) => {
-        let data = '';
-        res.on('data', chunk => (data += chunk));
-        res.on('end', () => {
-          if (res.statusCode === 200) resolve(data);
-          else reject(new Error(`HTTP ${res.statusCode}: ${data.slice(0, 300)}`));
-        });
-      },
-    );
+    const req = https.get(`https://${API_BASE}/${endpoint}?${qs}`, { timeout: 35000 }, (res) => {
+      let d = ''; res.on('data', c => d += c); res.on('end', () => {
+        res.statusCode === 200 ? resolve(d) : reject(new Error(`HTTP ${res.statusCode}: ${d.slice(0,300)}`));
+      });
+    });
     req.on('error', reject);
-    req.on('timeout', () => { req.destroy(); reject(new Error('Request timed out')); });
+    req.on('timeout', () => { req.destroy(); reject(new Error('Timeout')); });
   });
 }
 
-function askQuestion(url, question) {
-  const params = new URLSearchParams({
-    api_key: API_KEY, url, question, js: 'true', timeout: '20000',
-  });
-  return new Promise((resolve, reject) => {
-    const req = https.get(
-      `https://${API_BASE}/ai/question?${params.toString()}`,
-      { timeout: 25000 },
-      (res) => {
-        let data = '';
-        res.on('data', chunk => (data += chunk));
-        res.on('end', () => {
-          if (res.statusCode === 200) resolve(data);
-          else reject(new Error(`AI question HTTP ${res.statusCode}: ${data.slice(0, 200)}`));
-        });
-      },
-    );
-    req.on('error', reject);
-    req.on('timeout', () => { req.destroy(); reject(new Error('AI question timed out')); });
-  });
+function fetchListingText(url, page) {
+  return callAPI('text', { url: `${url}?page=${page}&sort=lowest-price`, js: 'true', timeout: '30000', proxy: 'stealth' });
+}
+
+function fetchProductHTML(url) {
+  return callAPI('html', { url, js: 'true', timeout: '25000', proxy: 'stealth' });
 }
 
 async function retry(fn, label) {
-  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+  for (let i = 0; i < MAX_RETRIES; i++) {
     try {
-      if (attempt > 0) {
-        const wait = INITIAL_BACKOFF_MS * Math.pow(2, attempt - 1);
-        console.log(`  Retry ${attempt + 1}/${MAX_RETRIES} (${label}) — waiting ${wait}ms…`);
-        await sleep(wait);
-      }
+      if (i > 0) { const w = INITIAL_BACKOFF_MS * Math.pow(2, i - 1); console.log(`  Retry ${i+1}/${MAX_RETRIES} (${label}) — ${w}ms…`); await sleep(w); }
       return await fn();
-    } catch (err) {
-      if (attempt === MAX_RETRIES - 1) throw err;
-      console.warn(`  Attempt ${attempt + 1} failed (${label}): ${err.message}`);
-    }
+    } catch (err) { if (i === MAX_RETRIES - 1) throw err; console.warn(`  Attempt ${i+1} failed (${label}): ${err.message}`); }
   }
 }
 
-function parsePrice(str) {
-  if (!str) return NaN;
-  return parseInt(str.replace(/[₦,\s]/g, ''), 10);
-}
+function parsePrice(str) { return str ? parseInt(str.replace(/[₦,\s]/g, ''), 10) : NaN; }
 
-async function extractSpecs(productUrl) {
-  const question = `Extract all technical specifications for this smartphone from the product page. Return ONLY a JSON object with these keys (use null if not found): display, resolution, ram, storage, battery, camera_rear, camera_front, processor, os, network, sim. Example: {"display":"6.9\" IPS LCD","ram":"6GB","storage":"128GB","battery":"5000mAh","camera_rear":"50MP","camera_front":"8MP","processor":"MediaTek Helio G85","os":"Android 15","network":"4G LTE","sim":"Dual SIM","resolution":"720x1640"}`;
-
-  const rawAnswer = await retry(
-    () => askQuestion(productUrl, question),
-    `specs: ${productUrl.slice(0, 60)}…`,
-  );
-
-  let cleaned = rawAnswer.trim();
-  cleaned = cleaned.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '');
-  const firstBrace = cleaned.indexOf('{');
-  const lastBrace = cleaned.lastIndexOf('}');
-  if (firstBrace !== -1 && lastBrace > firstBrace) {
-    cleaned = cleaned.slice(firstBrace, lastBrace + 1);
-  }
-
-  try {
-    const specs = JSON.parse(cleaned);
-    const keys = ['display','resolution','ram','storage','battery','camera_rear','camera_front','processor','os','network','sim'];
-    for (const k of keys) { if (!(k in specs)) specs[k] = null; }
-    return specs;
-  } catch (err) {
-    console.warn(`  Failed to parse specs JSON for ${productUrl}: ${err.message}`);
-    return { display:null,resolution:null,ram:null,storage:null,battery:null,camera_rear:null,camera_front:null,processor:null,os:null,network:null,sim:null,_raw:rawAnswer.slice(0,500) };
-  }
-}
-
-function parseListingHTML(html) {
+function parseListingText(text) {
   const products = [];
-  const articleRegex = /<article\s[^>]*class="[^"]*prd[^"]*"[^>]*>[\s\S]*?<\/article>/gi;
-  const articles = html.match(articleRegex) || [];
-
-  for (const articleStr of articles) {
-    try {
-      const nameMatch = articleStr.match(/<h3[^>]*class="[^"]*name[^"]*"[^>]*>([\s\S]*?)<\/h3>/i);
-      if (!nameMatch) continue;
-      const name = nameMatch[1].replace(/<[^>]+>/g, '').trim();
-
-      const priceMatch = articleStr.match(/<div[^>]*class="[^"]*prc[^"]*"[^>]*>([\s\S]*?)<\/div>/i);
-      if (!priceMatch) continue;
-      const price = parsePrice(priceMatch[1].replace(/<[^>]+>/g, '').trim());
-      if (isNaN(price)) continue;
-
-      const urlMatch = articleStr.match(/<a[^>]*href="(\/[^"]+)"/i);
-      const productPath = urlMatch ? urlMatch[1] : null;
-      if (!productPath || !productPath.includes('/')) continue;
-      const productUrl = productPath.startsWith('http') ? productPath : `https://www.jumia.com.ng${productPath}`;
-
-      const imgMatch = articleStr.match(/<img[^>]*data-src="([^"]+)"/i) || articleStr.match(/<img[^>]*src="([^"]+)"/i);
-      products.push({ name, price, productUrl, imageUrl: imgMatch ? imgMatch[1] : null });
-    } catch (e) { /* skip malformed */ }
-  }
-
-  // Fallback: broader extraction
-  if (products.length === 0) {
-    const priceRegex = /₦\s*[\d,]+/g;
-    const linkRegex = /<a[^>]*href="(\/[^"]*-\d+\.html)"[^>]*>/gi;
-    const prices = []; let pm;
-    while ((pm = priceRegex.exec(html)) !== null) {
-      const val = parsePrice(pm[0]);
-      if (!isNaN(val)) prices.push({ price: val, index: pm.index });
-    }
-    const links = []; let lm;
-    while ((lm = linkRegex.exec(html)) !== null) {
-      links.push({ url: `https://www.jumia.com.ng${lm[1]}`, index: lm.index });
-    }
-    for (const p of prices) {
-      const preceding = [...links].reverse().find(l => l.index < p.index);
-      if (!preceding) continue;
-      const beforeSection = html.slice(Math.max(0, p.index - 300), p.index);
-      const nameMatch = beforeSection.match(/<h3[^>]*class="[^"]*name[^"]*"[^>]*>([\s\S]*?)<\/h3>/i) || beforeSection.match(/>([^<]{10,80})<\/a>/i);
-      const name = nameMatch ? nameMatch[1].replace(/<[^>]+>/g, '').trim() : 'Unknown Phone';
-      const imgMatch = beforeSection.match(/<img[^>]*data-src="([^"]+)"/i) || beforeSection.match(/<img[^>]*src="([^"]+)"/i);
-      products.push({ name, price: p.price, productUrl: preceding.url, imageUrl: imgMatch ? imgMatch[1] : null });
-    }
+  const re = /\[\s*\n([^\]]+?)\n\s*₦\s*([\d,]+)\s*\n(?:[\d]+%\s*\n)?\s*\]\(([^)]+)\)/g;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    const name = m[1].replace(/\n\s*/g, ' ').trim();
+    const price = parseInt(m[2].replace(/,/g, ''), 10);
+    const slug = m[3];
+    if (isNaN(price) || !slug || !name) continue;
+    products.push({ name, price, productUrl: slug.startsWith('http') ? slug : `https://www.jumia.com.ng${slug}`, imageUrl: null });
   }
   return products;
 }
 
-function hasMorePages(html, currentPage) {
-  const paginationMatch = html.match(/aria-label="Page\s+(\d+)"/gi);
-  if (paginationMatch) {
-    const pages = paginationMatch.map(m => { const n = m.match(/\d+/); return n ? parseInt(n[0]) : 0; });
-    return currentPage < Math.max(...pages, currentPage);
+function hasMorePages() { return true; }
+
+function extractSpecsFromHTML(html) {
+  const $ = require('cheerio').load(html);
+  const specs = {};
+  $('table').each((i, t) => {
+    $(t).find('tr').each((j, r) => {
+      const cells = $(r).find('td, th');
+      if (cells.length >= 2) {
+        const k = $(cells[0]).text().trim().toLowerCase().replace(/\s+/g, '_').replace(/[^a-z_]/g, '');
+        const v = $(cells[1]).text().trim();
+        if (k && v && k.length < 40) specs[k] = v;
+      }
+    });
+  });
+  if (Object.keys(specs).length === 0) {
+    $('li, .spec-item, .-pvxs, .-pts').each((i, el) => {
+      const t = $(el).text().trim();
+      const m = t.match(/^(.+?)[:\s]{2,}(.+)$/);
+      if (m) { const k = m[1].toLowerCase().replace(/\s+/g, '_').replace(/[^a-z_]/g, ''); specs[k] = m[2].trim(); }
+    });
   }
-  return /next/i.test(html) && /page/i.test(html);
+  const km = {
+    display: ['display','screen_size','screen','display_size'],
+    ram: ['ram','memory','internal_memory','ram_size'],
+    storage: ['storage','rom','internal_storage','storage_capacity'],
+    battery: ['battery','battery_capacity'],
+    camera_rear: ['camera_rear','rear_camera','main_camera','back_camera','camera'],
+    camera_front: ['camera_front','front_camera','selfie_camera'],
+    processor: ['processor','cpu','chipset'],
+    os: ['os','operating_system','android_version'],
+    network: ['network','connectivity','network_type'],
+    sim: ['sim','sim_type'],
+    resolution: ['resolution','screen_resolution'],
+  };
+  const result = {};
+  for (const [tgt, keys] of Object.entries(km)) {
+    let found = null;
+    for (const k of keys) { if (specs[k]) { found = specs[k]; break; } }
+    result[tgt] = found;
+  }
+  return result;
+}
+
+async function extractSpecsAI(url) {
+  const q = 'Extract key specs from this phone page as JSON. Keys: display, resolution, ram, storage, battery, camera_rear, camera_front, processor, os, network, sim. Use null if unknown. Return ONLY JSON.';
+  const raw = await retry(() => callAPI('ai/question', { url, question: q, js: 'true', timeout: '25000', proxy: 'stealth' }), `specs: ${url.slice(0,60)}…`);
+  let c = raw.trim().replace(/^```(?:json)?\s*/i,'').replace(/\s*```$/i,'');
+  const b1 = c.indexOf('{'), b2 = c.lastIndexOf('}');
+  if (b1 !== -1 && b2 > b1) c = c.slice(b1, b2 + 1);
+  try {
+    const s = JSON.parse(c);
+    ['display','resolution','ram','storage','battery','camera_rear','camera_front','processor','os','network','sim'].forEach(k => { if (!(k in s)) s[k] = null; });
+    return s;
+  } catch(e) {
+    console.warn(`  JSON parse failed: ${e.message}`);
+    return { display:null,resolution:null,ram:null,storage:null,battery:null,camera_rear:null,camera_front:null,processor:null,os:null,network:null,sim:null,_raw:raw.slice(0,300) };
+  }
 }
 
 async function scrapeAll() {
-  const startTime = new Date();
-  console.log(`\n=== Jumia Phone Tracker — Starting scrape at ${startTime.toISOString()} ===\n`);
-
+  const st = new Date();
+  console.log(`\n=== Jumia Phone Tracker — ${st.toISOString()} ===\n`);
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
   console.log('-- Phase 1: Scanning listing pages (₦120k–250k) --\n');
-  let allCandidates = [];
-  let seenUrls = new Set();
-  let stoppedEarly = false;
+  let all = [], seen = new Set(), stopped = false;
 
-  for (let page = 1; page <= MAX_PAGES; page++) {
-    const pageUrl = `${LISTING_URL}?page=${page}&sort=lowest-price`;
-    console.log(`Page ${page}: ${pageUrl}`);
-    let html;
-    try {
-      html = await retry(() => fetchHTML(pageUrl), `listing page ${page}`);
-    } catch (err) {
-      console.error(`  Failed to fetch page ${page}: ${err.message}`);
+  for (let p = 1; p <= MAX_PAGES; p++) {
+    console.log(`Page ${p}…`);
+    let text;
+    try { text = await retry(() => fetchListingText(LISTING_URL, p), `listing page ${p}`); }
+    catch(e) { console.error(`  Failed: ${e.message}`); break; }
+    if (text.length < 500 || !/₦/.test(text)) {
+      console.warn(`  Suspicious content (${text.length} chars).`);
+      if (p === 1) console.error('  Page 1 invalid — possible block.');
       break;
     }
-    if (html.length < 2000 || !/smartphone/i.test(html)) {
-      console.warn(`  Page ${page} returned suspicious content (${html.length} chars).`);
-      if (page === 1) console.error('  Page 1 looks invalid — possible IP block or site structure change.');
-      break;
-    }
-
-    const products = parseListingHTML(html);
-    console.log(`  Found ${products.length} products`);
-    let newCandidates = 0, lowestOnPage = Infinity, highestOnPage = -Infinity;
-
-    for (const p of products) {
-      lowestOnPage = Math.min(lowestOnPage, p.price);
-      highestOnPage = Math.max(highestOnPage, p.price);
-      if (p.price >= MIN_PRICE && p.price <= MAX_PRICE) {
-        const urlKey = p.productUrl.split('?')[0];
-        if (!seenUrls.has(urlKey)) { seenUrls.add(urlKey); allCandidates.push(p); newCandidates++; }
+    const prods = parseListingText(text);
+    console.log(`  ${prods.length} products`);
+    let nc = 0, lo = Infinity, hi = -Infinity;
+    for (const pr of prods) {
+      lo = Math.min(lo, pr.price); hi = Math.max(hi, pr.price);
+      if (pr.price >= MIN_PRICE && pr.price <= MAX_PRICE) {
+        const uk = pr.productUrl.split('?')[0];
+        if (!seen.has(uk)) { seen.add(uk); all.push(pr); nc++; }
       }
     }
-    console.log(`    Prices: ₦${lowestOnPage.toLocaleString()} – ₦${highestOnPage.toLocaleString()}`);
-    console.log(`    New in range: ${newCandidates} | Total: ${allCandidates.length}`);
-
-    if (lowestOnPage > MAX_PRICE) {
-      console.log(`  Lowest on page (₦${lowestOnPage.toLocaleString()}) > ₦250k — stopping.`);
-      stoppedEarly = true; break;
-    }
-    if (!hasMorePages(html, page)) { console.log('  No more pages.'); break; }
+    console.log(`    ₦${lo.toLocaleString()} – ₦${hi.toLocaleString()} | +${nc} | total=${all.length}`);
+    if (lo > MAX_PRICE) { console.log(`  Lowest > ₦250k — stopping.`); stopped = true; break; }
+    if (!hasMorePages(text)) { console.log('  No more pages.'); break; }
     await sleep(DELAY_MS);
   }
 
-  console.log(`\n-- Phase 1 complete: ${allCandidates.length} candidates --\n`);
+  console.log(`\n-- Phase 1 done: ${all.length} candidates --\n`);
 
-  if (allCandidates.length === 0) {
-    const log = { timestamp: new Date().toISOString(), status: 'WARNING', message: 'No products parsed — check selectors.', candidatesFound: 0, specsSucceeded: 0, specsFailed: 0 };
-    writeJSON('last-run-log.json', log);
-    console.log('WARNING: No products found. Existing data files preserved.');
+  if (all.length === 0) {
+    writeJSON('last-run-log.json', { timestamp: new Date().toISOString(), status: 'WARNING', message: 'No products parsed — check selectors.', candidatesFound: 0, specsSucceeded: 0, specsFailed: 0 });
+    console.log('WARNING: No products found.');
     return;
   }
 
-  console.log(`-- Phase 2: Extracting specs for ${allCandidates.length} candidates --\n`);
-  let specsSucceeded = 0, specsFailed = 0;
+  console.log(`-- Phase 2: Extracting specs for ${all.length} candidates --\n`);
+  let ok = 0, fail = 0;
   const results = [];
 
-  for (let i = 0; i < allCandidates.length; i++) {
-    const c = allCandidates[i];
-    console.log(`[${i + 1}/${allCandidates.length}] ${c.name.slice(0, 50)}`);
-    let specs = null;
+  for (let i = 0; i < all.length; i++) {
+    const c = all[i];
+    console.log(`[${i+1}/${all.length}] ${c.name.slice(0,50)}`);
+    let specs;
     try {
-      specs = await extractSpecs(c.productUrl);
-      specsSucceeded++;
-      console.log('  Specs OK');
-    } catch (err) {
-      specsFailed++;
-      console.warn(`  Specs failed: ${err.message}`);
-      specs = { display:null,resolution:null,ram:null,storage:null,battery:null,camera_rear:null,camera_front:null,processor:null,os:null,network:null,sim:null,_error:err.message };
+      const html = await retry(() => fetchProductHTML(c.productUrl), `product: ${c.name.slice(0,40)}`);
+      specs = extractSpecsFromHTML(html);
+      const hasS = Object.values(specs).some(v => v !== null);
+      if (!hasS) { console.log('    cheerio found nothing, trying AI…'); specs = await extractSpecsAI(c.productUrl); }
+      const imgM = html.match(/<img[^>]*data-src="([^"]+)"/i) || html.match(/<img[^>]*src="(https?:\/\/[^"]*\.(?:jpg|jpeg|png|webp)[^"]*)"/i);
+      if (imgM) c.imageUrl = imgM[1];
+      ok++;
+      console.log(`  Specs OK (${Object.values(specs).filter(v=>v!==null).length} fields)`);
+    } catch(e) {
+      fail++;
+      console.warn(`  Failed: ${e.message}`);
+      specs = { display:null,resolution:null,ram:null,storage:null,battery:null,camera_rear:null,camera_front:null,processor:null,os:null,network:null,sim:null,_error:e.message };
     }
     results.push({ name:c.name, price:c.price, productUrl:c.productUrl, imageUrl:c.imageUrl, specs, scrapedAt:new Date().toISOString() });
-    if (i < allCandidates.length - 1) await sleep(DELAY_MS);
+    if (i < all.length - 1) await sleep(DELAY_MS);
   }
 
-  console.log(`\n-- Phase 2 complete: ${specsSucceeded} OK, ${specsFailed} failed --\n`);
-  console.log('-- Phase 3: Writing output files --\n');
+  console.log(`\n-- Phase 2 done: ${ok} OK, ${fail} failed --\n`);
+  console.log('-- Phase 3: Writing output --\n');
 
   writeJSON('phones.json', { generatedAt: new Date().toISOString(), priceRange: { min: MIN_PRICE, max: MAX_PRICE }, totalPhones: results.length, phones: results });
   console.log(`  data/phones.json — ${results.length} phones`);
 
   const history = updateHistory(results);
   writeJSON('history.json', history);
-  console.log(`  data/history.json — ${Object.keys(history.phones).length} phones tracked`);
+  console.log(`  data/history.json — ${Object.keys(history.phones).length} tracked`);
 
-  const elapsed = Math.round((new Date() - startTime) / 1000);
-  writeJSON('last-run-log.json', { timestamp: new Date().toISOString(), status: 'SUCCESS', elapsedSeconds: elapsed, candidatesFound: allCandidates.length, specsSucceeded, specsFailed, totalWritten: results.length });
+  const elapsed = Math.round((new Date() - st) / 1000);
+  writeJSON('last-run-log.json', { timestamp: new Date().toISOString(), status: 'SUCCESS', elapsedSeconds: elapsed, candidatesFound: all.length, specsSucceeded: ok, specsFailed: fail, totalWritten: results.length });
   console.log(`  data/last-run-log.json`);
-  console.log(`\n=== Scrape complete in ${elapsed}s ===\n`);
+  console.log(`\n=== Complete in ${elapsed}s ===\n`);
 }
 
-function loadExistingJSON(filename) {
-  const fp = path.join(DATA_DIR, filename);
+function loadExistingJSON(fn) {
+  const fp = path.join(DATA_DIR, fn);
   if (!fs.existsSync(fp)) return null;
   try { return JSON.parse(fs.readFileSync(fp, 'utf-8')); } catch { return null; }
 }
 
-function writeJSON(filename, data) {
-  fs.writeFileSync(path.join(DATA_DIR, filename), JSON.stringify(data, null, 2), 'utf-8');
-}
+function writeJSON(fn, d) { fs.writeFileSync(path.join(DATA_DIR, fn), JSON.stringify(d, null, 2), 'utf-8'); }
 
 function updateHistory(phones) {
-  let history = loadExistingJSON('history.json');
-  if (!history || !history.phones) {
-    history = { description: 'Price history for tracked phones.', lastUpdated: new Date().toISOString(), phones: {} };
-  }
+  let h = loadExistingJSON('history.json');
+  if (!h || !h.phones) h = { description: 'Price history for tracked phones.', lastUpdated: new Date().toISOString(), phones: {} };
   const today = new Date().toISOString().split('T')[0];
-  for (const phone of phones) {
-    const key = normalizeKey(phone.name);
-    if (!history.phones[key]) {
-      history.phones[key] = { name: phone.name, productUrl: phone.productUrl, imageUrl: phone.imageUrl, priceHistory: [] };
-    }
-    const hist = history.phones[key];
-    if (phone.imageUrl) hist.imageUrl = phone.imageUrl;
-    if (phone.productUrl) hist.productUrl = phone.productUrl;
-    const lastEntry = hist.priceHistory[hist.priceHistory.length - 1];
-    if (!lastEntry || lastEntry.price !== phone.price || lastEntry.date !== today) {
-      hist.priceHistory.push({ date: today, price: phone.price, scrapedAt: phone.scrapedAt });
-    }
+  for (const p of phones) {
+    const k = p.name.toLowerCase().replace(/[^a-z0-9\s]/g,'').replace(/\s+/g,'-').replace(/(\d+)gb\s*ram/i,'$1gb').replace(/(\d+)gb\s*rom/i,'$1gb').replace(/-+/g,'-').replace(/^-|-$/g,'').slice(0,80);
+    if (!h.phones[k]) h.phones[k] = { name:p.name, productUrl:p.productUrl, imageUrl:p.imageUrl, priceHistory:[] };
+    const hi = h.phones[k];
+    if (p.imageUrl) hi.imageUrl = p.imageUrl;
+    const last = hi.priceHistory[hi.priceHistory.length-1];
+    if (!last || last.price !== p.price || last.date !== today) hi.priceHistory.push({ date:today, price:p.price, scrapedAt:p.scrapedAt });
   }
-  history.lastUpdated = new Date().toISOString();
-  return history;
-}
-
-function normalizeKey(name) {
-  return name.toLowerCase().replace(/[^a-z0-9\s]/g, '').replace(/\s+/g, '-').replace(/(\d+)gb\s*ram/i, '$1gb').replace(/(\d+)gb\s*rom/i, '$1gb').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 80);
+  h.lastUpdated = new Date().toISOString();
+  return h;
 }
 
 scrapeAll().catch(err => {
-  console.error('\n=== FATAL ERROR ===');
-  console.error(err);
-  try {
-    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-    writeJSON('last-run-log.json', { timestamp: new Date().toISOString(), status: 'FATAL', error: err.message });
-  } catch (_) {}
+  console.error('\n=== FATAL ==='); console.error(err);
+  try { if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true }); writeJSON('last-run-log.json', { timestamp: new Date().toISOString(), status: 'FATAL', error: err.message }); } catch(_) {}
   process.exit(1);
 });
