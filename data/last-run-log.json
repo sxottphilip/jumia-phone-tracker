@@ -1,0 +1,8 @@
+{
+  "timestamp": "2026-08-07T12:09:24.268Z",
+  "status": "WARNING",
+  "message": "No products parsed — check selectors.",
+  "candidatesFound": 0,
+  "specsSucceeded": 0,
+  "specsFailed": 0
+}
