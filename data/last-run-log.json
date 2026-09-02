@@ -1,9 +1,8 @@
 {
-  "timestamp": "2026-09-01T12:08:40.612Z",
-  "status": "SUCCESS",
-  "elapsedSeconds": 5316,
-  "candidatesFound": 627,
-  "specsSucceeded": 5,
-  "specsFailed": 622,
-  "totalWritten": 627
+  "timestamp": "2026-09-02T10:05:59.498Z",
+  "status": "WARNING",
+  "message": "No products parsed — check selectors.",
+  "candidatesFound": 0,
+  "specsSucceeded": 0,
+  "specsFailed": 0
 }
